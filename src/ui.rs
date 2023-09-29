@@ -11,8 +11,8 @@ use crate::shader::{self, Shader};
 use crate::esc::EscSeq;
 use crate::orbit::Orbit;
 
-const FPS: u32 = 60;
-const FRAME_INTERVAL: Duration = Duration::new(0, (1e9 as u32) / FPS);
+const FPS: u64 = 60;
+const FRAME_INTERVAL: Duration = Duration::from_millis(1000 / FPS);
 
 pub struct UI<'a> {
   seq: EscSeq,
@@ -98,13 +98,20 @@ impl UI<'_> {
       tx.send((bytes.to_vec(), n)).unwrap();
     });
 
+    let mut last = SystemTime::now();
     loop {
       let start = SystemTime::now();
       match rx.try_recv() {
           Ok((bytes, n)) => {
             for b in bytes.iter().take(n) {
               if self.seq.parse_one(*b as char) {
-                self.handle();
+                let cur = SystemTime::now();
+                if cur.duration_since(last).unwrap() > FRAME_INTERVAL {
+                  self.handle();
+                  last = cur;
+                } else {
+                  self.seq.reset();
+                }
               }
             }
           },

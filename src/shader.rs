@@ -7,9 +7,13 @@
 use std::collections::HashMap;
 
 use crate::model::Model;
-use crate::render;
+use crate::vertex::Vertex;
 use crate::texture::Texture;
-use nalgebra::{Vector3, Vector4, Matrix2x3, Matrix3, Matrix4};
+
+use nalgebra::{Vector3, Vector4, Matrix3, Matrix4};
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+
+const ONES: Vector4<f32> = Vector4::new(1.0, 1.0, 1.0, 1.0);
 
 #[derive(Debug)]
 pub struct Shader<'a> {
@@ -17,18 +21,17 @@ pub struct Shader<'a> {
   pub height: i32,
 
   model: &'a mut Model,
+
+  light: Vector4<f32>,
   uniform_light: Vector3<f32>,
-  varying_uv: Matrix2x3<f32>,
-  varying_normal: Matrix3<f32>,
-  view_triangle: Matrix3<f32>,
 
   pub model_view: Matrix4<f32>,
   pub projection: Matrix4<f32>,
   pub viewport: Matrix4<f32>,
 
   diffuse_map: Texture,
-  /*normal_map: Texture,
-  specular_map: Texture,*/
+  normal_map: Texture,
+  specular_map: Texture,
 }
 
 impl Shader<'_> {
@@ -38,96 +41,85 @@ impl Shader<'_> {
       height: h as i32,
 
       model: m,
+
+      light: Vector4::identity(),
       uniform_light: Vector3::identity(),
-      varying_uv: Matrix2x3::identity(),
-      varying_normal: Matrix3::identity(),
-      view_triangle: Matrix3::identity(),
 
       model_view: Matrix4::identity(),
       projection: Matrix4::identity(),
       viewport: Matrix4::identity(),
 
       diffuse_map: Texture::new(),
-      /*normal_map: Texture::new(),
-      specular_map: Texture::new(),*/
+      normal_map: Texture::new(),
+      specular_map: Texture::new(),
     }
   }
 
-  pub fn vertex(&mut self, iface: usize, nthvert: usize) -> Vector4<f32> {
+  pub fn vertex(&self, vert: &mut Vertex, iface: usize, nthvert: usize) -> Vector4<f32> {
     if let Some(x) = self.model.uv(iface, nthvert) {
-      self.varying_uv.set_column(nthvert, &x);
+      vert.varying_uv.set_column(nthvert, &x);
     }
 
     if let Some(x) = self.model.normal(iface, nthvert) {
       let prod = self.model_view.try_inverse().unwrap().transpose() * Vector4::new(x.x, x.y, x.z, 0.0);
-      self.varying_normal.set_column(nthvert, &prod.xyz());
+      vert.varying_normal.set_column(nthvert, &prod.xyz());
     }
 
     let out = self.model_view * self.model.vert(iface, nthvert);
-    self.view_triangle.set_column(nthvert, &out.xyz());
+    vert.view_triangle.set_column(nthvert, &out.xyz());
     self.projection * out
   }
 
   // TODO: Overhaul this with more accurate shading.
-  pub fn fragment(&self, vec: Vector3<f32>) -> Vector4<f32> {
-    let bn = (self.varying_normal * vec).normalize();
-    let mut uv = self.varying_uv * vec;
+  pub fn fragment(&self, vert: &Vertex, worldspace: Vector3<f32>, screenspace: Vector3<f32>) -> Vector4<f32> {
+    let bn = (vert.varying_normal * worldspace).normalize();
+    let mut uv = vert.varying_uv * screenspace;
     uv.y = 1.0 - uv.y;
 
-    if self.diffuse_map.loaded {
-      let mut tmp = self.diffuse_map.get(uv);
-      tmp /= 255.0;
-      tmp.w = 1.0;
-      return tmp;
-    }
-
-    let ai = Matrix3::from_columns(&[
-      self.view_triangle.column(1) - self.view_triangle.column(0),
-      self.view_triangle.column(2) - self.view_triangle.column(0),
+    let ai = match Matrix3::from_columns(&[
+      vert.view_triangle.column(1) - vert.view_triangle.column(0),
+      vert.view_triangle.column(2) - vert.view_triangle.column(0),
       bn
-    ]).try_inverse().unwrap();
-    let i = ai * Vector3::new(self.varying_uv.m12 - self.varying_uv.m11, self.varying_uv.m13 - self.varying_uv.m11, 0.0);
-    let j = ai * Vector3::new(self.varying_uv.m22 - self.varying_uv.m21, self.varying_uv.m23 - self.varying_uv.m21, 0.0);
+    ]).try_inverse() {
+      Some(ai) => ai,
+      None => { return Vector4::zeros(); }
+    };
+    let i = ai * Vector3::new(vert.varying_uv.m12 - vert.varying_uv.m11, vert.varying_uv.m13 - vert.varying_uv.m11, 0.0);
+    let j = ai * Vector3::new(vert.varying_uv.m22 - vert.varying_uv.m21, vert.varying_uv.m23 - vert.varying_uv.m21, 0.0);
     let b = Matrix3::from_columns(&[
       i.normalize(),
       j.normalize(),
       bn
     ]).transpose();
 
-    /*if self.diffuse_map.loaded {
-      let normal_raw = self.normal_map.get(uv).xyz();
-      let normal_flip = Vector3::new(normal_raw.z, normal_raw.y, normal_raw.x) * 127.0;
-      let normal_sub = normal_flip - Vector3::new(1.0, 1.0, 1.0);
+    let normal = (b * (match self.normal_map.loaded {
+      true => self.normal_map.get(uv).zyx(),
+      false => worldspace,
+    })).normalize();
+    let specular = match self.specular_map.loaded {
+      true => self.specular_map.get(uv).z,
+      false => 0.0,
+    };
 
-      let n = match self.normal_map.loaded {
-        true => (b * normal_sub).normalize(),
-        false => (b * Vector3::new(0.0, 0.0, -1.0)).normalize(),
-      };
-      let diff = n.dot(&self.uniform_light).max(0.0);
-      let r = ((n * diff * 2.0) - self.uniform_light).normalize();
-      let spec = (-r.z).max(0.0).powf(5.0 + self.specular_map.get(uv).z);
+    let result_diffuse = normal.dot(&self.uniform_light).max(0.35);
+    let diffuse_contrib = ((normal * result_diffuse * 2.0) - self.uniform_light).normalize();
+    let result_specular = (-diffuse_contrib.z).max(0.0).powf(5.0 + specular);
 
-      let diffuse = self.diffuse_map.get(uv).scale(diff + spec).add_scalar(10.0);
-      Vector4::new(
-        diffuse.x.clamp(0.0, 255.0) / 255.0,
-        diffuse.y.clamp(0.0, 255.0) / 255.0,
-        diffuse.z.clamp(0.0, 255.0) / 255.0,
-        1.0
-      )
-    } else {*/
-      let n = (b * Vector3::new(1.0, 0.0, 0.0)).normalize();
-      let dot = n.dot(&self.uniform_light);
-      let diff = dot.max(0.0);
-      let r = ((n * dot * 2.0) - self.uniform_light).normalize();
-      let spec = (-r.z).max(0.0).powf(5.0);
-      let val = (diff + spec).clamp(0.0, 1.0).powf(3.0);
-      Vector4::new(val, val, val, 1.0)
-    // }
+    let diffuse = (match self.diffuse_map.loaded {
+      true => self.diffuse_map.get(uv),
+      false => ONES * 255.0,
+    }).scale(2.0 * (result_diffuse + result_specular)).add_scalar(10.0);
+    Vector4::new(
+      diffuse.x.clamp(0.0, 255.0),
+      diffuse.y.clamp(0.0, 255.0),
+      diffuse.z.clamp(0.0, 255.0),
+      1.0
+    )
   }
 
-  pub fn set_light(&mut self, light: Vector3<f32>) {
-    let n = (self.model_view * Vector4::new(light.x, light.y, light.z, 0.0)).normalize();
-    self.uniform_light = Vector3::new(n.x, n.y, n.z);
+  pub fn set_light(&mut self, x: f32, y: f32, z: f32) {
+    self.light = Vector4::new(x, y, z, 0.0).normalize();
+    self.uniform_light = (self.model_view * self.light).xyz();
   }
 
   pub fn set_projection(&mut self, f: f32) {
@@ -140,7 +132,7 @@ impl Shader<'_> {
   }
 
   pub fn look_at(&mut self, eye: &Vector3<f32>) {
-    let z = (-eye).normalize();
+    let z = (self.model.center - eye).normalize();
     let x = Vector3::y().cross(&z).normalize();
     let y = z.cross(&x).normalize();
 
@@ -160,10 +152,6 @@ impl Shader<'_> {
     self.model_view = m_inv * tr;
   }
 
-  pub fn set_modelview(&mut self, m: &Matrix4<f32>) {
-    self.model_view.copy_from(m);
-  }
-
   pub fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32) {
     self.viewport = Matrix4::new(
       w / 2.0, 0.0, 0.0, x + w / 2.0,
@@ -174,22 +162,34 @@ impl Shader<'_> {
   }
 
   pub fn render(&mut self) {
-    let mut out: HashMap<i32, String> = HashMap::with_capacity((self.width * self.height) as usize);
-    let mut zbuffer: HashMap<i32, f32> = HashMap::with_capacity((self.width * self.height) as usize);
-    for i in 0..self.model.nfaces() {
-      let mut clip_vert = vec![];
-      for j in 0..3 {
-        clip_vert.push(self.vertex(i, j));
+    let result: Vec<Vec<(i32, f32, String)>> =
+      (0..self.model.nfaces()).into_par_iter().map(|i| {
+        let mut vert = Vertex::new();
+        for j in 0..3 {
+          vert.clip[j] = self.vertex(&mut vert, i, j);
+        }
+        vert.triangle(self)
+      }).collect();
+
+    let mut pixels: HashMap<i32, (f32, String)> = HashMap::with_capacity((self.width * self.height) as usize);
+    for items in result {
+      for (idx, z, color) in items {
+        if let Some((prev_z, _)) = pixels.get(&idx) {
+          if *prev_z < z {
+            continue;
+          }
+        }
+
+        pixels.insert(idx, (z, color));
       }
-      render::triangle(self, clip_vert, &mut zbuffer, &mut out);
     }
 
     let mut esc = String::from("\x1b[0m\x1b[0H");
     let mut prev = String::new();
-    let default = String::from("\x1b[0m ");
+    let default = (0.0, String::from("\x1b[0m "));
     for y in 1..self.height {
       for x in 1..self.width {
-        let cell = out.get(&(x + (y * self.width))).unwrap_or(&default);
+        let (_, cell) = pixels.get(&(x + (y * self.width))).unwrap_or(&default);
 
         if *cell == prev {
           esc += " ";
@@ -200,20 +200,19 @@ impl Shader<'_> {
       }
       esc += "\n";
     }
+    // TODO: Find some way to do a raw printf
     println!("{}", esc);
   }
 
   pub fn set_diffuse(&mut self, filename: &String) {
     self.diffuse_map.load(filename);
   }
-  /*
   pub fn set_normal(&mut self, filename: &String) {
     self.normal_map.load(filename);
   }
   pub fn set_specular(&mut self, filename: &String) {
     self.specular_map.load(filename);
   }
-  */
 }
 
 pub fn start() {

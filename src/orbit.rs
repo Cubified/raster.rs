@@ -2,7 +2,7 @@
  * orbit.rs: 3D, mouse-based orbit controls.
  */
 
-use nalgebra::{Vector2, Vector3, Matrix4};
+use nalgebra::{Vector2, Vector3};
 
 use crate::shader::Shader;
 
@@ -73,8 +73,6 @@ impl Orbit<'_> {
     self.offset.y = self.spherical.y.cos();
     self.offset.z = sin_phi * self.spherical.x.cos();
 
-    let matrix = Matrix4::new_translation(&self.offset);
-    self.shader.set_modelview(&matrix);
     self.shader.look_at(&(self.offset * self.distance));
     self.shader.render();
   }

@@ -24,6 +24,10 @@ pub struct Model {
   face_vert: Vec<i32>,
   face_uv: Vec<i32>,
   face_normal: Vec<i32>,
+
+  bbox: [f32; 6],
+
+  pub center: Vector3<f32>,
 }
 
 impl Model {
@@ -36,6 +40,14 @@ impl Model {
       face_vert: vec!(),
       face_uv: vec!(),
       face_normal: vec!(),
+
+      bbox: [
+        std::f32::MAX, std::f32::MIN,
+        std::f32::MAX, std::f32::MIN,
+        std::f32::MAX, std::f32::MIN,
+      ],
+
+      center: Vector3::zeros(),
     }
   }
   pub fn load_obj(path: &String) -> Result<Model, Box<dyn Error>> {
@@ -94,6 +106,16 @@ impl Model {
           }
 
           if cmd == "v " {
+            out.bbox[0] = out.bbox[0].min(tmp[0]);
+            out.bbox[1] = out.bbox[1].max(tmp[0]);
+
+
+            out.bbox[2] = out.bbox[2].min(tmp[1]);
+            out.bbox[3] = out.bbox[3].max(tmp[1]);
+
+            out.bbox[4] = out.bbox[4].min(tmp[2]);
+            out.bbox[5] = out.bbox[5].max(tmp[2]);
+
             out.vertex_buffer.push(Vector3::from_vec(tmp));
           } else if cmd == "vn" {
             out.normal_buffer.push(Vector3::from_vec(tmp).normalize());
@@ -101,12 +123,21 @@ impl Model {
             out.uv_buffer.push(Vector2::new(tmp[0], 1.0 - tmp[1]));
           }
         },
+        "# " => (),
         x => {
-            eprintln!("Invalid command: {}", x);
-            continue;
+          eprintln!("Unrecognized OBJ command: {}", x);
+          continue;
         }
       };
     }
+
+    // Approximate center of mass for centering model view matrix.
+    //   Works well for symmetric models, much less so for asymmetric ones.
+    out.center = Vector3::new(
+      (out.bbox[0] + out.bbox[1]) / 2.0,
+      (out.bbox[2] + out.bbox[3]) / 2.0,
+      (out.bbox[4] + out.bbox[5]) / 2.0,
+    );
 
     Ok(out)
   }
