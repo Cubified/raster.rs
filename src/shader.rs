@@ -5,6 +5,7 @@
  */
 
 use std::collections::HashMap;
+use std::io::{self, Write};
 
 use crate::model::Model;
 use crate::vertex::Vertex;
@@ -70,7 +71,6 @@ impl Shader<'_> {
     self.projection * out
   }
 
-  // TODO: Overhaul this with more accurate shading.
   pub fn fragment(&self, vert: &Vertex, worldspace: Vector3<f32>, screenspace: Vector3<f32>) -> Vector4<f32> {
     let bn = (vert.varying_normal * worldspace).normalize();
     let mut uv = vert.varying_uv * screenspace;
@@ -101,14 +101,18 @@ impl Shader<'_> {
       false => 0.0,
     };
 
-    let result_diffuse = normal.dot(&self.uniform_light).max(0.35);
+    let factor = match self.diffuse_map.loaded {
+        true => 2.0,
+        false => 1.0,
+    };
+    let result_diffuse = normal.dot(&self.uniform_light).max((factor - 1.0) * 0.65);
     let diffuse_contrib = ((normal * result_diffuse * 2.0) - self.uniform_light).normalize();
     let result_specular = (-diffuse_contrib.z).max(0.0).powf(5.0 + specular);
 
     let diffuse = (match self.diffuse_map.loaded {
       true => self.diffuse_map.get(uv),
       false => ONES * 255.0,
-    }).scale(2.0 * (result_diffuse + result_specular)).add_scalar(10.0);
+    }).scale(factor * (result_diffuse + result_specular)).add_scalar(10.0);
     Vector4::new(
       diffuse.x.clamp(0.0, 255.0),
       diffuse.y.clamp(0.0, 255.0),
@@ -200,8 +204,7 @@ impl Shader<'_> {
       }
       esc += "\n";
     }
-    // TODO: Find some way to do a raw printf
-    println!("{}", esc);
+    let _ = io::stdout().write_all(esc.as_bytes());
   }
 
   pub fn set_diffuse(&mut self, filename: &String) {
